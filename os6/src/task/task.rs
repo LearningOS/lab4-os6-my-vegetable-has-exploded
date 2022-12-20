@@ -2,16 +2,28 @@
 
 use super::TaskContext;
 use super::{pid_alloc, KernelStack, PidHandle};
-use crate::config::TRAP_CONTEXT;
+use crate::config::{BIG_STRIDE, MAX_SYSCALL_NUM, TRAP_CONTEXT};
+use crate::fs::{File, Stdin, Stdout};
+use crate::mm::translated_refmut;
 use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
+use crate::timer::get_time_us;
 use crate::trap::{trap_handler, TrapContext};
+use alloc::string::String;
 use alloc::sync::{Arc, Weak};
+use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefMut;
-use crate::fs::{File, Stdin, Stdout};
-use alloc::string::String;
-use crate::mm::translated_refmut;
+
+// LAB3
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Pass(pub u64);
+
+impl Pass {
+    pub fn stride(&mut self, prio: u64) {
+        self.0 += BIG_STRIDE / prio;
+    }
+}
 
 /// Task control block structure
 ///
@@ -22,6 +34,8 @@ pub struct TaskControlBlock {
     pub pid: PidHandle,
     /// Kernel stack corresponding to PID
     pub kernel_stack: KernelStack,
+    // LAB1
+    pub init_time: usize,
     // mutable
     inner: UPSafeCell<TaskControlBlockInner>,
 }
@@ -49,6 +63,11 @@ pub struct TaskControlBlockInner {
     pub children: Vec<Arc<TaskControlBlock>>,
     /// It is set when active exit or execution error occurs
     pub exit_code: i32,
+    //LAB1 syscall record
+    pub syscall_counter: Vec<u32>,
+    //LAB3
+    pub pass: Pass,
+    pub prio: u64,
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
 }
 
@@ -71,9 +90,30 @@ impl TaskControlBlockInner {
     pub fn is_zombie(&self) -> bool {
         self.get_status() == TaskStatus::Zombie
     }
+
+    //LAB1
+    pub fn record_syscall(&mut self, syscall_id: usize) {
+        self.syscall_counter[syscall_id] += 1;
+    }
+
+    pub fn get_record_syscall(&mut self) -> Vec<u32> {
+        self.syscall_counter.clone()
+    }
+
+    //LAB2
+    pub fn mmap(&mut self, virt_start: VirtAddr, virt_end: VirtAddr, port: usize) -> isize {
+        self.memory_set.mmap(virt_start, virt_end, port)
+    }
+
+    pub fn unmap(&mut self, virt_start: VirtAddr, virt_end: VirtAddr) -> isize {
+        self.memory_set.unmap(virt_start, virt_end)
+    }
+    //LAB3
+    pub fn set_priority(&mut self, priority: isize) {
+        self.prio = priority as u64;
+    }
     pub fn alloc_fd(&mut self) -> usize {
-        if let Some(fd) = (0..self.fd_table.len())
-            .find(|fd| self.fd_table[*fd].is_none()) {
+        if let Some(fd) = (0..self.fd_table.len()).find(|fd| self.fd_table[*fd].is_none()) {
             fd
         } else {
             self.fd_table.push(None);
@@ -106,6 +146,7 @@ impl TaskControlBlock {
         let task_control_block = Self {
             pid: pid_handle,
             kernel_stack,
+            init_time: get_time_us() / 1_000,
             inner: unsafe {
                 UPSafeCell::new(TaskControlBlockInner {
                     trap_cx_ppn,
@@ -116,6 +157,9 @@ impl TaskControlBlock {
                     parent: None,
                     children: Vec::new(),
                     exit_code: 0,
+                    syscall_counter: vec![0; MAX_SYSCALL_NUM],
+                    pass: Pass(0),
+                    prio: 16,
                     fd_table: alloc::vec![
                         // 0 -> stdin
                         Some(Arc::new(Stdin)),
@@ -136,6 +180,63 @@ impl TaskControlBlock {
             kernel_stack_top,
             trap_handler as usize,
         );
+        task_control_block
+    }
+    // LAB3
+    /// Load a new elf and return a tcb then start execution
+    pub fn spawn(self: &Arc<TaskControlBlock>, elf_data: &[u8]) -> Arc<TaskControlBlock> {
+        let mut parent_inner = self.inner_exclusive_access();
+        // memory_set with elf program headers/trampoline/trap context/user stack
+        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        let trap_cx_ppn = memory_set
+            .translate(VirtAddr::from(TRAP_CONTEXT).into())
+            .unwrap()
+            .ppn();
+        // alloc a pid and a kernel stack in kernel space
+        let pid_handle = pid_alloc();
+        let kernel_stack = KernelStack::new(&pid_handle);
+        let kernel_stack_top = kernel_stack.get_top();
+        let task_control_block = Arc::new(TaskControlBlock {
+            pid: pid_handle,
+            kernel_stack,
+            init_time: get_time_us() / 1_000,
+            inner: unsafe {
+                UPSafeCell::new(TaskControlBlockInner {
+                    trap_cx_ppn,
+                    base_size: parent_inner.base_size,
+                    task_cx: TaskContext::goto_trap_return(kernel_stack_top),
+                    task_status: TaskStatus::Ready,
+                    memory_set,
+                    parent: Some(Arc::downgrade(self)),
+                    children: Vec::new(),
+                    exit_code: 0,
+                    syscall_counter: vec![0; MAX_SYSCALL_NUM],
+                    pass: Pass(0),
+                    prio: 16,
+                    fd_table: alloc::vec![
+                        // 0 -> stdin
+                        Some(Arc::new(Stdin)),
+                        // 1 -> stdout
+                        Some(Arc::new(Stdout)),
+                        // 2 -> stderr
+                        Some(Arc::new(Stdout)),
+                    ],
+                })
+            },
+        });
+        // add child
+        parent_inner.children.push(task_control_block.clone());
+        // initialize trap_cx
+        let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
+        *trap_cx = TrapContext::app_init_context(
+            entry_point,
+            user_sp,
+            KERNEL_SPACE.exclusive_access().token(),
+            kernel_stack_top,
+            trap_handler as usize,
+        );
+        // **** release inner automatically
+        // return
         task_control_block
     }
     /// Load a new elf to replace the original application address space and start execution
@@ -189,6 +290,7 @@ impl TaskControlBlock {
         let task_control_block = Arc::new(TaskControlBlock {
             pid: pid_handle,
             kernel_stack,
+            init_time: get_time_us() / 1_000,
             inner: unsafe {
                 UPSafeCell::new(TaskControlBlockInner {
                     trap_cx_ppn,
@@ -199,6 +301,9 @@ impl TaskControlBlock {
                     parent: Some(Arc::downgrade(self)),
                     children: Vec::new(),
                     exit_code: 0,
+                    syscall_counter: vec![0; MAX_SYSCALL_NUM],
+                    pass: Pass(0),
+                    prio: 16,
                     fd_table: new_fd_table,
                 })
             },
@@ -216,6 +321,10 @@ impl TaskControlBlock {
     }
     pub fn getpid(&self) -> usize {
         self.pid.0
+    }
+
+    pub fn get_start_time(&self) -> usize {
+        return self.init_time;
     }
 }
 

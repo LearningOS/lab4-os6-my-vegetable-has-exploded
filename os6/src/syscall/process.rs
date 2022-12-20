@@ -1,16 +1,17 @@
 //! Process management syscalls
 
-use crate::mm::{translated_refmut, translated_ref, translated_str};
-use crate::task::{
-    add_task, current_task, current_user_token, exit_current_and_run_next,
-    suspend_current_and_run_next, TaskStatus,
-};
+use crate::config::MAX_SYSCALL_NUM;
 use crate::fs::{open_file, OpenFlags};
+use crate::mm::{translated_ptr, translated_ref, translated_refmut, translated_str, VirtAddr};
+use crate::task::{
+    add_task, current_task, current_user_token, exit_current_and_run_next, get_syscall_record,
+    get_time_interval, mmap, set_priority, suspend_current_and_run_next, unmap, TaskStatus,
+};
 use crate::timer::get_time_us;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use crate::config::MAX_SYSCALL_NUM;
-use alloc::string::String;
+use core::convert::TryInto;
 
 #[repr(C)]
 #[derive(Debug)]
@@ -71,7 +72,6 @@ pub fn sys_exec(path: *const u8) -> isize {
     }
 }
 
-
 /// If there is not a child process whose pid is same as given, return -1.
 /// Else if there is a child process but it is still running, return -2.
 pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
@@ -112,37 +112,93 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
 // YOUR JOB: 引入虚地址后重写 sys_get_time
 pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
     let _us = get_time_us();
-    // unsafe {
-    //     *ts = TimeVal {
-    //         sec: us / 1_000_000,
-    //         usec: us % 1_000_000,
-    //     };
-    // }
+    let ts = translated_ptr(current_user_token(), _ts);
+    unsafe {
+        *ts = TimeVal {
+            sec: _us / 1_000_000,
+            usec: _us % 1_000_000,
+        };
+    }
     0
 }
 
 // YOUR JOB: 引入虚地址后重写 sys_task_info
 pub fn sys_task_info(ti: *mut TaskInfo) -> isize {
-    -1
+    let ti = translated_ptr(current_user_token(), ti);
+    unsafe {
+        *ti = TaskInfo {
+            status: TaskStatus::Running,
+            syscall_times: get_syscall_record().try_into().unwrap(),
+            time: get_time_interval(),
+        }
+    }
+    0
 }
 
 // YOUR JOB: 实现sys_set_priority，为任务添加优先级
 pub fn sys_set_priority(_prio: isize) -> isize {
-    -1
+    if _prio < 2 {
+        return -1;
+    }
+    set_priority(_prio);
+    return _prio;
+}
+
+fn check_mmap_port(port: usize) -> bool {
+    if (port & (!0x07) != 0) || (port & 0x7 == 0) {
+        return false;
+    }
+    true
 }
 
 // YOUR JOB: 扩展内核以实现 sys_mmap 和 sys_munmap
 pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    -1
+    if check_mmap_port(_port) == false {
+        return -1;
+    }
+    let virt_start = VirtAddr::from(_start);
+    if virt_start.page_offset() != 0 {
+        return -1;
+    }
+    if _len <= 0 {
+        return -1;
+    }
+    let virt_end = VirtAddr::from(_start + _len);
+    mmap(virt_start, virt_end, _port)
 }
 
 pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    -1
+    let virt_start = VirtAddr::from(_start);
+    if virt_start.page_offset() != 0 {
+        return -1;
+    }
+    if _len <= 0 {
+        return -1;
+    }
+    let virt_end = VirtAddr::from(_start + _len);
+    unmap(virt_start, virt_end)
 }
 
 //
 // YOUR JOB: 实现 sys_spawn 系统调用
-// ALERT: 注意在实现 SPAWN 时不需要复制父进程地址空间，SPAWN != FORK + EXEC 
+// ALERT: 注意在实现 SPAWN 时不需要复制父进程地址空间，SPAWN != FORK + EXEC
 pub fn sys_spawn(_path: *const u8) -> isize {
-    -1
+    let token = current_user_token();
+    let path = translated_str(token, _path);
+    if let Some(app_inode) = open_file(path.as_str(), OpenFlags::RDONLY) {
+        let all_data = app_inode.read_all();
+        let task = current_task().unwrap();
+        let new_task = task.spawn(&all_data);
+        let new_pid = new_task.pid.0;
+        // modify trap context of new_task, because it returns immediately after switching
+        let trap_cx = new_task.inner_exclusive_access().get_trap_cx();
+        // we do not have to move to next instruction since we have done it before
+        // for child process, fork returns 0
+        trap_cx.x[10] = 0;
+        // add new task to scheduler
+        add_task(new_task);
+        new_pid as isize
+    } else {
+        -1
+    }
 }

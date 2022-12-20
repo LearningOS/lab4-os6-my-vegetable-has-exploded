@@ -17,16 +17,17 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
+use crate::config::PAGE_SIZE;
+use crate::fs::{open_file, OpenFlags};
+use crate::mm::MapPermission;
+use crate::mm::VirtAddr;
+pub use crate::syscall::process::TaskInfo;
+use crate::timer::get_time_us;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use lazy_static::*;
 use manager::fetch_task;
 use switch::__switch;
-use crate::mm::VirtAddr;
-use crate::mm::MapPermission;
-use crate::config::PAGE_SIZE;
-use crate::timer::get_time_us;
-pub use crate::syscall::process::TaskInfo;
-use crate::fs::{open_file, OpenFlags};
 pub use task::{TaskControlBlock, TaskStatus};
 
 pub use context::TaskContext;
@@ -103,4 +104,45 @@ lazy_static! {
 
 pub fn add_initproc() {
     add_task(INITPROC.clone());
+}
+
+// LAB1: Try to implement your function to update or get task info!
+pub fn record_syscall(syscall_id: usize) {
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    inner.record_syscall(syscall_id);
+}
+
+pub fn get_syscall_record() -> Vec<u32> {
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    let result = inner.get_record_syscall();
+    result
+}
+
+pub fn get_time_interval() -> usize {
+    let task = current_task().unwrap();
+    let now = get_time_us() / 1_000;
+    let interval = now - task.get_start_time();
+    interval
+}
+
+//LAB2
+pub fn mmap(virt_start: VirtAddr, virt_end: VirtAddr, port: usize) -> isize {
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    inner.mmap(virt_start, virt_end, port)
+}
+
+pub fn unmap(virt_start: VirtAddr, virt_end: VirtAddr) -> isize {
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    inner.unmap(virt_start, virt_end)
+}
+
+//LAB3
+pub fn set_priority(priority: isize) {
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    inner.set_priority(priority);
 }

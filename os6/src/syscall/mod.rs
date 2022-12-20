@@ -33,12 +33,15 @@ const SYSCALL_TASK_INFO: usize = 410;
 mod fs;
 pub mod process;
 
+use crate::fs::Stat;
+use crate::task::record_syscall;
 use fs::*;
 use process::*;
-use crate::fs::Stat;
 
 /// handle syscall exception with `syscall_id` and other arguments
 pub fn syscall(syscall_id: usize, args: [usize; 4]) -> isize {
+    //    LAB1: You may need to update syscall info here.
+    record_syscall(syscall_id);
     match syscall_id {
         SYSCALL_LINKAT => sys_linkat(args[1] as *const u8, args[3] as *const u8),
         SYSCALL_UNLINKAT => sys_unlinkat(args[1] as *const u8),

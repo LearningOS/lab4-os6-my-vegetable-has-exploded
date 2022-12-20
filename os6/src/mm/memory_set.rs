@@ -4,7 +4,7 @@ use super::{frame_alloc, FrameTracker};
 use super::{PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
-use crate::config::{MEMORY_END, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT, USER_STACK_SIZE, MMIO};
+use crate::config::{MEMORY_END, MMIO, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT, USER_STACK_SIZE};
 use crate::sync::UPSafeCell;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -162,7 +162,8 @@ impl MemorySet {
                     MapType::Identical,
                     MapPermission::R | MapPermission::W,
                 ),
-            None);
+                None,
+            );
         }
         memory_set
     }
@@ -233,6 +234,54 @@ impl MemorySet {
             user_stack_top,
             elf.header.pt2.entry_point() as usize,
         )
+    }
+    //LAB2 pop a area from map_area
+    fn pop(&mut self, mut map_area: MapArea) -> isize {
+        let index = self
+            .areas
+            .iter()
+            .position(|area| area.vpn_range == map_area.vpn_range);
+        if let Some(index) = index {
+            self.areas.remove(index);
+            map_area.unmap(&mut self.page_table);
+            0
+        } else {
+            -1
+        }
+    }
+    // LAB2
+    /// mmap a section of memory
+    pub fn mmap(&mut self, virt_start: VirtAddr, virt_end: VirtAddr, port: usize) -> isize {
+        let mut map_perm = MapPermission::U;
+        map_perm |= MapPermission::from_bits((port as u8) << 1).unwrap();
+        let map_area = MapArea::new(virt_start, virt_end, MapType::Framed, map_perm);
+        for vpn in map_area.vpn_range {
+            // print!("mmap vpn: {:x}  ", usize::from(vpn));
+            if let Some(pte) = self.translate(vpn) {
+                if pte.is_valid() {
+                    return -1;
+                }
+            }
+        }
+        // println!(" mmap end");
+        self.push(map_area, None);
+        0
+    }
+    /// unmap a section of memory
+    pub fn unmap(&mut self, virt_start: VirtAddr, virt_end: VirtAddr) -> isize {
+        let map_area = MapArea::new(virt_start, virt_end, MapType::Framed, MapPermission::U);
+        for vpn in map_area.vpn_range {
+            // print!("unmap vpn: {:x}  ", usize::from(vpn));
+            if let Some(pte) = self.translate(vpn) {
+                if !pte.is_valid() {
+                    return -1;
+                }
+            } else {
+                return -1;
+            }
+        }
+        // println!(" unmap end");
+        self.pop(map_area)
     }
     /// Copy an identical user_space
     pub fn from_existed_user(user_space: &MemorySet) -> MemorySet {
