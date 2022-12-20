@@ -1,5 +1,6 @@
-use super::File;
+use super::{File, StatMode};
 use crate::drivers::BLOCK_DEVICE;
+use crate::fs::Stat;
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
 use alloc::sync::Arc;
@@ -7,6 +8,7 @@ use alloc::vec::Vec;
 use bitflags::*;
 use easy_fs::{EasyFileSystem, Inode};
 use lazy_static::*;
+use crate::logging;
 
 /// A wrapper around a filesystem inode
 /// to implement File trait atop
@@ -115,6 +117,18 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
     }
 }
 
+pub fn linkat(old_name: &str, new_name: &str) -> isize {
+    if ROOT_INODE.linkat(old_name, new_name).is_some() {
+        return 0;
+    } else {
+        return -1;
+    }
+}
+
+pub fn unlinkat(name: &str) -> isize {
+    return ROOT_INODE.unlinkat(name);
+}
+
 impl File for OSInode {
     fn readable(&self) -> bool {
         self.readable
@@ -127,12 +141,14 @@ impl File for OSInode {
         let mut total_read_size = 0usize;
         for slice in buf.buffers.iter_mut() {
             let read_size = inner.inode.read_at(inner.offset, *slice);
+			debug!("read {} bytes from inode", read_size);
             if read_size == 0 {
                 break;
             }
             inner.offset += read_size;
             total_read_size += read_size;
         }
+		debug!("read {} bytes from inode totally", total_read_size);
         total_read_size
     }
     fn write(&self, buf: UserBuffer) -> usize {
@@ -145,5 +161,21 @@ impl File for OSInode {
             total_write_size += write_size;
         }
         total_write_size
+    }
+    fn fstat(&self) -> Stat {
+        let inner = self.inner.exclusive_access();
+        let (inode_id, is_file, nlink) = inner.inode.get_stat();
+		drop(inner);
+        let mut mode = StatMode::DIR;
+        if is_file {
+            mode = StatMode::FILE;
+        }
+        Stat {
+            dev: 0,
+            ino: inode_id as u64,
+            mode: mode,
+            nlink: nlink,
+            pad: [0; 7],
+        }
     }
 }
