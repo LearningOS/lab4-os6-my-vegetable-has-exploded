@@ -31,7 +31,7 @@ test: randomize
 ifdef INITPROC
 	cp -f user/build/elf/ch$(CHAPTER)_usertest.elf user/build/elf/ch$(CHAPTER)b_initproc.elf
 endif
-	make -C ../os run | tee stdout-ch$(CHAPTER)
+	make -C ../os run LOG=DEBUG | tee stdout-ch$(CHAPTER)
 	python3 check/ch$(CHAPTER).py < stdout-ch$(CHAPTER)
 
 ifdef LAB
